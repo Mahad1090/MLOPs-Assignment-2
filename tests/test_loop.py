@@ -487,7 +487,7 @@ def test_nudge_lists_credential_looking_search_hits_not_covered(mock_groq, tmp_p
     agent.read_paths.update({".gitignore", "infra/ec2.tf", "infra/db.tf", "ok.py"})
     msg = agent._coverage_gap_message([{"file": "infra/ec2.tf", "evidence": "x"}])
     assert msg and "infra/db.tf:1" in msg and "infra/ec2.tf" not in msg.split("credentials in files")[1].split(".")[0]
-    assert "never copy the secret value" in msg
+    assert "never copy the secret value" in msg.lower()
     agent.coverage_nudged = False
     msg = agent._coverage_gap_message([{"file": "infra/ec2.tf"}, {"file": "infra/db.tf"}])
     assert "credentials" not in (msg or "")  # both credential hits are now covered by findings
@@ -496,3 +496,22 @@ def test_nudge_lists_credential_looking_search_hits_not_covered(mock_groq, tmp_p
 def test_gemini_fallback_order_prefers_newer_full_models_over_lite():
     pref = loop_module.PROVIDERS["gemini"]["preference"]
     assert pref.index("gemini-3.8-flash") < pref.index("gemini-3.1-flash-lite") < pref.index("gemini-flash-lite-latest")
+
+
+@patch("loop.Groq")
+def test_uncovered_credential_leads_get_exactly_one_follow_up_nudge(mock_groq, tmp_path):
+    (tmp_path / "infra").mkdir()
+    (tmp_path / "infra" / "ec2.tf").write_text('key = "AKIAIOSFODNN7EXAMPLE"\n', encoding="utf-8")
+    agent, _ = make_agent(mock_groq, [], tmp_path, coverage=False)  # first (general) nudge already used
+    agent._execute_tool("find_secrets", {})
+    first = agent._coverage_gap_message([])
+    assert first and "infra/ec2.tf:1" in first and "sample key" in first
+    assert agent.secret_renudged is True
+    assert agent._coverage_gap_message([]) is None  # never nudges a third time
+    agent.secret_renudged = False
+    assert agent._coverage_gap_message([{"file": "infra/ec2.tf"}]) is None  # covered leads: no follow-up
+
+
+def test_prompt_treats_sample_looking_keys_as_findings():
+    import prompts
+    assert "AKIAIOSFODNN7EXAMPLE" in prompts.SYSTEM_PROMPT and "IS a finding" in prompts.SYSTEM_PROMPT

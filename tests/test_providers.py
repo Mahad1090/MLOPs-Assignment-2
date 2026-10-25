@@ -427,3 +427,18 @@ def test_single_overload_is_just_retried(tmp_path, monkeypatch):
     agent.model, agent.model_fallbacks = "model-a", ["model-b"]
     assert agent._chat(messages=agent.messages) is ok
     assert agent.model == "model-a"
+
+
+def test_exhausted_models_do_not_consume_the_retry_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop_module.time, "sleep", lambda *_: None)
+    ok = MagicMock()
+    ok.choices = [MagicMock()]
+    quota = LLMAPIError("Gemini HTTP 429: quota [quota=GenerateRequestsPerDayPerProjectPerModel-FreeTier]", 429)
+    # 12 exhausted models in front of the one that works: more than the 8-attempt retry budget
+    agent, fake = _agent_with_script(tmp_path, [quota] * 12 + [ok])
+    agent.model = "m0"
+    agent.model_fallbacks = [f"m{i}" for i in range(1, 13)]
+    assert agent._chat(messages=agent.messages) is ok
+    assert agent.model == "m12"
+    assert fake.chat.completions.create.call_count == 13
+

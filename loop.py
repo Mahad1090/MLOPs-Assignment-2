@@ -57,7 +57,14 @@ from llm import (
 )
 from prompts import SYSTEM_PROMPT, TOOL_DEFINITIONS
 from schemas import AuditReport, Violation, sanitize_evidence
-from tools import FIXTURE_DIR_NAMES, _resolve_safe_path, dispatch_tool_call, is_key_file
+from tools import (
+    FIXTURE_DIR_NAMES,
+    _resolve_safe_path,
+    dispatch_tool_call,
+    is_key_file,
+    python_docstring_lines,
+    secret_lead_kind,
+)
 
 # Load local environment variables from .env if present
 load_dotenv()
@@ -244,20 +251,6 @@ def default_model_for(provider: str) -> str:
     return os.getenv(cfg["model_env"]) or cfg["default_model"]
 
 
-# Credential-looking text in search_code output. Provider-prefixed tokens and private-key headers are
-# reported as-is; generic NAME = "value" assignments are skipped when the value looks like a placeholder.
-HARD_SECRET_LEAD = re.compile(
-    r"AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-    r"|\bxox[baprs]-[A-Za-z0-9-]{10,}|\bsk-ant-[A-Za-z0-9_-]{20,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}"
-    r"|\bAIza[0-9A-Za-z_-]{30,}|\bgsk_[A-Za-z0-9]{20,}"
-)
-ASSIGNED_SECRET_LEAD = re.compile(
-    r"""(?i)(?:api[_-]?key|secret[_-]?key|access[_-]?key|client[_-]?secret|secret|password|passwd|token)\w*\s*[:=]\s*["']([^"'\s]{8,})["']"""
-)
-PLACEHOLDER_VALUE = re.compile(
-    r"(?i)change[_-]?me|example|your[_-]|placeholder|x{4,}|<[^>]+>|\$\{|%\(|dummy|sample|todo|\*{4,}|^\$|^env\.|getenv|os\.environ"
-)
-
 LLM_MAX_ATTEMPTS = 8
 LLM_REQUEST_TIMEOUT = 90.0
 LLM_MAX_BACKOFF = 65.0
@@ -358,6 +351,7 @@ class AgentLoop:
         self.read_paths: set = set()
         self.workflows_inspected = False
         self.coverage_nudged = False
+        self.secret_renudged = False
         self.high_risk_leads: List[tuple] = []
         self.secret_leads: List[tuple] = []  # (path, line) of credential-looking search hits
 
@@ -454,7 +448,9 @@ class AgentLoop:
         """One chat completion with retry/back-off. Raises LLMError when exhausted."""
         last_exc: Optional[Exception] = None
         overloads = 0  # consecutive "overloaded / high demand" errors on the current model
-        for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+        attempt = 0
+        while attempt < LLM_MAX_ATTEMPTS:
+            attempt += 1
             if self._time_left() <= 0:
                 raise LLMError("Audit wall-clock timeout reached before the LLM responded.")
             try:
@@ -494,6 +490,7 @@ class AgentLoop:
                 if (status == 404 and "model" in text or daily_quota) and self.model_fallbacks:
                     old, self.model = self.model, self.model_fallbacks.pop(0)
                     self._log(f"[!] Model '{old}' unavailable or out of daily quota; switching to '{self.model}'.")
+                    attempt -= 1  # a model switch is not a retry; it must not use up the retry budget
                     continue
                 if daily_quota:
                     raise LLMError(f"Daily API quota exhausted for model '{self.model}' and no fallback models remain.") from exc
@@ -540,6 +537,11 @@ class AgentLoop:
             ]
         if name == "search_code":
             self._collect_secret_leads(output)
+        elif name == "find_secrets":
+            for m in re.finditer(r"^(\S+?):(\d+): \[", output, re.M):
+                lead = (m.group(1), int(m.group(2)))
+                if lead not in self.secret_leads:
+                    self.secret_leads.append(lead)
         self._tool_cache[key] = output
         return output
 
@@ -626,12 +628,12 @@ class AgentLoop:
             name = path.rsplit("/", 1)[-1].lower()
             if parts & FIXTURE_DIR_NAMES or name.endswith((".md", ".rst", ".txt")) or ".example" in name or ".sample" in name:
                 continue
-            hit = HARD_SECRET_LEAD.search(text)
-            if not hit:
-                assigned = ASSIGNED_SECRET_LEAD.search(text)
-                hit = assigned if assigned and not PLACEHOLDER_VALUE.search(assigned.group(1)) else None
-            if hit and (path, line_no) not in self.secret_leads:
-                self.secret_leads.append((path, line_no))
+            kind = secret_lead_kind(text)
+            if not kind or (path, line_no) in self.secret_leads:
+                continue
+            if kind != "token/key pattern" and line_no in python_docstring_lines(Path(self.repo_dir) / path):
+                continue  # example code inside a docstring
+            self.secret_leads.append((path, line_no))
 
     def _uncovered_secret_leads(self, violations: Optional[List[Any]]) -> List[str]:
         """Credential-looking search hits in files that no submitted finding mentions."""
@@ -661,6 +663,18 @@ class AgentLoop:
 
     def _coverage_gap_message(self, violations: Optional[List[Any]] = None) -> Optional[str]:
         if self.coverage_nudged:
+            # One follow-up, only for credential leads that are still not covered (these leads are high precision)
+            if not self.secret_renudged:
+                secrets = self._uncovered_secret_leads(violations)
+                if secrets:
+                    self.secret_renudged = True
+                    return (
+                        "Your findings still do not cover these credential-looking lines: " + ", ".join(secrets)
+                        + ". A hardcoded value in code, config or infrastructure files is a security finding even when it "
+                          "resembles a well-known sample key (for example AKIAIOSFODNN7EXAMPLE) or sits in a demo application. "
+                          "Report each one (high for cloud/provider keys and private keys, medium for passwords), or say why it is "
+                          "only a variable reference, placeholder or test fixture. Never copy the value. Then submit again."
+                    )
             return None
         missing = self._unreviewed_key_files()
         absent = self._absent_standard_items()
@@ -674,8 +688,9 @@ class AgentLoop:
             parts.append(
                 "search_code surfaced text that looks like credentials in files your findings do not mention: "
                 + ", ".join(secrets)
-                + ". Open each, and report it as a security finding if it is a real credential (not a placeholder, "
-                  "test fixture or environment lookup); never copy the secret value")
+                + ". Open each and report it as a security finding when a literal credential sits in code, config or "
+                  "infrastructure files (a documented sample key or a demo password is still a hardcoded credential); skip only "
+                  "variable references, placeholders and test fixtures. Never copy the secret value")
         if leads:
             parts.append(
                 "inspect_workflows flagged high-risk leads in files your findings do not mention: "

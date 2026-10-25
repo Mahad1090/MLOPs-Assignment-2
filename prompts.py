@@ -15,7 +15,7 @@ CYCLE: Observe -> Reason -> Select Tool -> Execute -> Interpret -> Report. Befor
 INVESTIGATION (adapt to the stack you see; you decide the order):
 1. list_files first. Note language(s), manifests, CI, Docker/IaC, tests, committed artifacts. git_log for history. Large repos: list_files shows a layout summary plus key files; open key files first, then use search_code with file_pattern.
 2. inspect_workflows, then read_file on workflows that need detail (triggers, permissions, secrets, gates, deploy). Read dependency manifests/lockfiles, Dockerfile, config and .env* files, .gitignore, tests.
-3. search_code for: hardcoded credentials (api_key/secret/token/password assignments, AKIA, ghp_, BEGIN PRIVATE KEY), machine paths (C:\\Users, /Users/, /home/), debug flags, disabled TLS, eval/shell=True. git_history_search for secrets committed then deleted. run_ruff for Python lint evidence.
+3. find_secrets for credential-looking strings (placeholders/tests/docs already filtered; verify each with read_file). search_code for: other hardcoded credentials (api_key/secret/token/password assignments, AKIA, ghp_, BEGIN PRIVATE KEY), machine paths (C:\\Users, /Users/, /home/), debug flags, disabled TLS, eval/shell=True. git_history_search for secrets committed then deleted. run_ruff for Python lint evidence.
 4. Verify: re-read cited files with read_file so file and line come from the `NNNN:` prefixes. Never guess line numbers.
 
 CATEGORIES AND DEFECTS
@@ -40,6 +40,7 @@ PRECISION RULES (false positives are penalised as much as misses)
 - Files inside tests/, fixtures/, examples/, docs/ (e.g. tests/app/.env with dummy values) are intentional fixtures, not violations, unless they hold real-looking live credentials.
 - inspect_workflows prints heuristic RISK LEADS. They are leads, not verdicts: read the workflow and confirm. pull_request_target is dangerous only when the job checks out or runs PR-head code (head.sha/head.ref/head_ref/gh pr checkout); `ref: github.head_ref` under a plain pull_request trigger is normal. Echoing a secret or private key into logs is a real security defect.
 - Report each distinct workflow weakness once with the specific workflow file and line (several affected files: cite the clearest one and name the others in evidence).
+- A credential-shaped literal (cloud/provider key, private key, password, token) in code, config or IaC IS a finding even if it looks like a well-known sample key (AKIAIOSFODNN7EXAMPLE) or the app is a demo; mention that in the evidence. Variable references, placeholders and test fixtures are not.
 - Never claim an action/tool/image/package version does not exist, is "future" or "invalid": your knowledge of releases is older than many repos (e.g. actions/checkout@v7 is real). Only flag versions that are mutable (@main/@latest), clearly outdated for a reason shown in the repo, or unpinned.
 - Never put real secret values in evidence (including passwords inside URLs); write [REDACTED].
 - Report absent CI as ONE finding only (not one per missing lint/test/build step).
@@ -129,6 +130,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "function": {
             "name": "inspect_workflows",
             "description": "GitHub Actions overview: numbered security/CI-relevant lines of every workflow (triggers, permissions, uses:, continue-on-error, injection, test/deploy commands).",
+            "parameters": _NO_ARGS,
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_secrets",
+            "description": "Heuristic scan for hardcoded credentials (tokens, private keys, password/secret assignments) across the repo; values redacted, tests/docs/placeholders excluded. Leads only: verify with read_file.",
             "parameters": _NO_ARGS,
         },
     },

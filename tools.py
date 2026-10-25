@@ -16,6 +16,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from schemas import sanitize_evidence
+
 # Suspicious file names or patterns to highlight in repository hygiene
 SUSPICIOUS_NAMES = {
     ".env",
@@ -110,6 +112,97 @@ def is_key_file(rel_path: str, include_lockfiles: bool = True) -> bool:
     if include_lockfiles and LOCKFILE_REGEX.match(name):
         return True
     return any(rx.match(name) for rx in KEY_FILE_REGEXES)
+
+
+PER_FILE_MATCH_CAP = 5       # search_code: one noisy file must not fill the whole result list
+MAX_COLLECTED_MATCHES = 400  # search_code: stop collecting after this many lines
+MAX_SECRET_LEADS = 40
+NOISY_FILE = re.compile(
+    r"(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|uv\.lock|pipfile\.lock|go\.sum|cargo\.lock"
+    r"|gemfile\.lock|composer\.lock|packages\.lock\.json|mix\.lock|npm-shrinkwrap\.json)$|\.min\.(js|css)$|\.map$|\.snap$",
+    re.I,
+)
+
+# Credential-looking text. Provider-prefixed tokens and private-key headers are reported as-is; generic
+# NAME = value assignments are skipped when the value looks like a placeholder, a boolean or a variable.
+HARD_SECRET_LEAD = re.compile(
+    r"AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{10,}|\bsk-ant-[A-Za-z0-9_-]{20,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}"
+    r"|\bAIza[0-9A-Za-z_-]{30,}|\bgsk_[A-Za-z0-9]{20,}"
+)
+_SECRET_NAME = r"(?:api[_-]?key|secret[_-]?key|access[_-]?key|client[_-]?secret|secret|password|passwd|pwd|token)\w*"
+QUOTED_SECRET_LEAD = re.compile(rf"""(?i)\b{_SECRET_NAME}["']?\s*[:=]\s*["']([^"']{{3,60}})["']""")
+# unquoted values (YAML/env files): must mix letters and digits, which separates real secrets from identifiers
+UNQUOTED_SECRET_LEAD = re.compile(
+    rf"""(?i)\b{_SECRET_NAME}\s*[:=]\s*((?=[^\s"'(){{}}\[\]<>,;#]*\d)(?=[^\s"'(){{}}\[\]<>,;#]*[A-Za-z])[^\s"'(){{}}\[\]<>,;#$]{{6,}})"""
+)
+PLACEHOLDER_VALUE = re.compile(
+    r"(?i)change[_-]?me|example|your[_-]|placeholder|x{4,}|<[^>]+>|\$\{|%\(|dummy|sample|todo|\*{4,}|^\$|^env\.|getenv|os\.environ"
+    r"|^(true|false|null|none|nil|string|number|required|optional|secret|password|token|passwd|empty|redacted)$"
+    r"|^\\"
+)
+DOC_CONTEXT = re.compile(r"(?i)\b(sample|example|e\.g\.|dummy|placeholder|lorem)\b")
+# Generated / vendored / presentation files whose "secret"-named variables are not credentials
+NON_SECRET_SUFFIXES = (".css", ".scss", ".sass", ".less", ".svg", ".ejs.map", ".lock")
+VENDORED_DIRS = {"vendor", "third_party", "third-party", "bower_components", "dist", "build", "node_modules", "fontawesome"}
+
+
+def secret_lead_kind(text: str) -> Optional[str]:
+    """Classify a line as a likely hardcoded credential, or None."""
+    if HARD_SECRET_LEAD.search(text):
+        return "token/key pattern"
+    if DOC_CONTEXT.search(text):
+        return None  # prose/sample/example lines are documentation, not credentials
+    match = QUOTED_SECRET_LEAD.search(text)
+    if match:
+        value = match.group(1)
+        words = value.split()
+        # short passphrases like 'keyboard cat' are plausible secrets; sentences are UI text
+        if (" " not in value or (len(words) <= 2 and len(value) <= 30)) and not PLACEHOLDER_VALUE.search(value):
+            return "credential assignment"
+        return None
+    match = UNQUOTED_SECRET_LEAD.search(text)
+    if match and not PLACEHOLDER_VALUE.search(match.group(1)):
+        return "credential assignment"
+    return None
+
+
+def triple_quoted_lines(lines: List[str]) -> set:
+    """1-indexed line numbers that sit inside a Python triple-quoted string (docstring/example text)."""
+    inside: set = set()
+    state: Optional[str] = None
+    for number, line in enumerate(lines, start=1):
+        if state:
+            inside.add(number)
+        for match in re.finditer(r'"""|\'\'\'', line):
+            token = match.group(0)
+            if state is None:
+                state = token
+            elif state == token:
+                state = None
+        if state:
+            inside.add(number)
+    return inside
+
+
+def python_docstring_lines(path: Path) -> set:
+    """Docstring line numbers of a .py file (empty set for other files or on read errors)."""
+    if path.suffix.lower() != ".py":
+        return set()
+    try:
+        return triple_quoted_lines(path.read_text(encoding="utf-8", errors="ignore").splitlines())
+    except OSError:
+        return set()
+
+
+def _search_priority(rel_path: str) -> int:
+    """0 = source/config, 1 = prose docs, 2 = tests/fixtures/examples (listed last)."""
+    parts = {part.lower() for part in rel_path.split("/")[:-1]}
+    if parts & FIXTURE_DIR_NAMES:
+        return 2
+    if rel_path.lower().endswith((".md", ".rst", ".txt")):
+        return 1
+    return 0
 
 
 def _git_env() -> Dict[str, str]:
@@ -327,7 +420,9 @@ def read_file(repo_dir: str, path: str, start_line: int = 1, end_line: int = 200
 def search_code(repo_dir: str, pattern: str, file_pattern: Optional[str] = None) -> str:
     """Search for regex or keyword patterns across text files with exact line numbers.
 
-    Returns filepath:line_number: matched_line.
+    Returns filepath:line_number: matched_line. At most 5 matches per file are shown so a single noisy
+    file cannot fill the result list; lockfiles/minified files are skipped unless ``file_pattern`` is
+    given; source and config files are listed before docs and tests.
     """
     base = Path(repo_dir).resolve()
     if not base.exists() or not base.is_dir():
@@ -338,9 +433,7 @@ def search_code(repo_dir: str, pattern: str, file_pattern: Optional[str] = None)
     except re.error as e:
         return f"Error: Invalid regular expression '{pattern}': {str(e)}"
 
-    matches: List[str] = []
     max_matches = 50
-
     file_filter = None
     if file_pattern:
         try:
@@ -351,22 +444,26 @@ def search_code(repo_dir: str, pattern: str, file_pattern: Optional[str] = None)
     deadline = time.monotonic() + SEARCH_TIME_BUDGET
     timed_out = False
     scanned = 0
+    per_file: Dict[str, List[str]] = {}
+    extra: Dict[str, int] = {}
+    collected = 0
 
     for root, dirs, files in os.walk(base):
-        dirs[:] = [d for d in dirs if d not in SKIP_SEARCH_DIRS]
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_SEARCH_DIRS)
         if time.monotonic() > deadline:
             timed_out = True
             break
-        for f in files:
+        for f in sorted(files):
             scanned += 1
             if scanned % 200 == 0 and time.monotonic() > deadline:
                 timed_out = True
                 break
             full_path = Path(root) / f
-            rel_path = full_path.relative_to(base)
-            rel_str = rel_path.as_posix()
+            rel_str = full_path.relative_to(base).as_posix()
 
             if file_filter and not file_filter.search(rel_str):
+                continue
+            if not file_filter and NOISY_FILE.search(rel_str):
                 continue
 
             # Skip binaries, symlinks (could point outside the sandbox) and huge files
@@ -380,18 +477,22 @@ def search_code(repo_dir: str, pattern: str, file_pattern: Optional[str] = None)
             except Exception:
                 continue
 
+            hits = 0
             for idx, line in enumerate(text.splitlines(), start=1):
-                if regex.search(line):
-                    # Truncate long lines to keep LLM context compact
+                if not regex.search(line):
+                    continue
+                hits += 1
+                if hits <= PER_FILE_MATCH_CAP:
                     truncated = line.strip()
                     if len(truncated) > 160:
                         truncated = truncated[:157] + "..."
-                    matches.append(f"{rel_str}:{idx}: {truncated}")
-                    if len(matches) >= max_matches:
-                        break
-            if len(matches) >= max_matches:
+                    per_file.setdefault(rel_str, []).append(f"{rel_str}:{idx}: {truncated}")
+                    collected += 1
+                else:
+                    extra[rel_str] = extra.get(rel_str, 0) + 1
+            if collected >= MAX_COLLECTED_MATCHES:
                 break
-        if timed_out or len(matches) >= max_matches:
+        if timed_out or collected >= MAX_COLLECTED_MATCHES:
             break
 
     note = (
@@ -400,13 +501,107 @@ def search_code(repo_dir: str, pattern: str, file_pattern: Optional[str] = None)
         if timed_out
         else ""
     )
-    if not matches:
+    if not per_file:
         return f"No matches found for pattern: '{pattern}'" + note
 
-    header = f"Found {len(matches)} match(es) for '{pattern}':"
-    if len(matches) >= max_matches:
-        header += f" (capped at {max_matches})"
+    matches: List[str] = []
+    capped = False
+    for rel_str in sorted(per_file, key=lambda r: (_search_priority(r), r)):
+        for line in per_file[rel_str]:
+            if len(matches) >= max_matches:
+                capped = True
+                break
+            matches.append(line)
+        if rel_str in extra and len(matches) < max_matches:
+            matches.append(f"  ... (+{extra[rel_str]} more matches in {rel_str})")
+        if capped:
+            break
+    shown = len([m for m in matches if not m.startswith("  ...")])
+    header = f"Found {shown} match(es) in {len({m.split(':', 1)[0] for m in matches if not m.startswith('  ...')})} file(s) for '{pattern}':"
+    if capped or collected >= MAX_COLLECTED_MATCHES:
+        header += f" (capped at {max_matches}; narrow with file_pattern)"
     return "\n".join([header] + matches) + note
+
+
+def find_secrets(repo_dir: str) -> str:
+    """List lines that look like hardcoded credentials (tokens, private keys, passwords) across the repo.
+
+    Heuristic leads for the agent to verify with read_file. Values are redacted in the output. Test
+    fixtures, docs, ``.example`` files, lockfiles and placeholder/variable values are excluded, and at most
+    5 hits per file are shown.
+    """
+    base = Path(repo_dir).resolve()
+    if not base.exists() or not base.is_dir():
+        return f"Error: Repository directory does not exist: {repo_dir}"
+
+    deadline = time.monotonic() + SEARCH_TIME_BUDGET
+    leads: List[str] = []
+    excluded = 0
+    scanned = 0
+    timed_out = False
+    for root, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_SEARCH_DIRS)
+        if time.monotonic() > deadline:
+            timed_out = True
+            break
+        for f in sorted(files):
+            scanned += 1
+            if scanned % 200 == 0 and time.monotonic() > deadline:
+                timed_out = True
+                break
+            full_path = Path(root) / f
+            rel = full_path.relative_to(base).as_posix()
+            low = f.lower()
+            if (
+                NOISY_FILE.search(rel)
+                or full_path.suffix.lower() in BINARY_SUFFIXES
+                or full_path.is_symlink()
+            ):
+                continue
+            parts_lower = {part.lower() for part in rel.split("/")[:-1]}
+            skip_context = (
+                _search_priority(rel) > 0
+                or ".example" in low
+                or ".sample" in low
+                or low.endswith((".template",) + NON_SECRET_SUFFIXES)
+                or bool(parts_lower & VENDORED_DIRS)
+            )
+            try:
+                if full_path.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                    continue
+                text = full_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            hits = 0
+            doc_lines = triple_quoted_lines(text.splitlines()) if full_path.suffix.lower() == ".py" else set()
+            for idx, line in enumerate(text.splitlines(), start=1):
+                kind = secret_lead_kind(line)
+                if not kind:
+                    continue
+                if kind != "token/key pattern" and idx in doc_lines:
+                    excluded += 1  # a code example inside a docstring is documentation, not a credential
+                    continue
+                if skip_context:
+                    excluded += 1
+                    continue
+                hits += 1
+                if hits <= PER_FILE_MATCH_CAP and len(leads) < MAX_SECRET_LEADS:
+                    preview = sanitize_evidence(line.strip())
+                    if len(preview) > 140:
+                        preview = preview[:137] + "..."
+                    leads.append(f"{rel}:{idx}: [{kind}] {preview}")
+        if timed_out or len(leads) >= MAX_SECRET_LEADS:
+            break
+
+    note = f"\n[scan stopped after {SEARCH_TIME_BUDGET:.0f}s ({scanned} files)]" if timed_out else ""
+    footer = (
+        f"\nExcluded {excluded} hit(s) in tests/docs/examples; placeholders, booleans and variable references "
+        "are never listed. These are leads: confirm with read_file that the value is a real credential before "
+        "reporting, and never copy the value."
+    )
+    if not leads:
+        return "No credential-looking strings found outside tests/docs/examples." + footer + note
+    return f"Found {len(leads)} credential-looking line(s) (values redacted):\n" + "\n".join(leads) + footer + note
 
 
 def git_log(repo_dir: str, max_commits: int = 25) -> str:
@@ -714,6 +909,7 @@ AVAILABLE_TOOLS: Dict[str, Any] = {
     "git_status": git_status,
     "run_ruff": run_ruff,
     "inspect_workflows": inspect_workflows,
+    "find_secrets": find_secrets,
     "git_history_search": git_history_search,
 }
 

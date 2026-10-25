@@ -278,3 +278,118 @@ def test_cli_unknown_repo_exits_2_quickly_with_hint(tmp_path):
 def test_cli_rejects_non_github_urls(tmp_path):
     proc = run_cli(["--repo", "https://gitlab.com/a/b", "--output", str(tmp_path / "r.json"), "--api-key", "gsk_x"], tmp_path)
     assert proc.returncode == 1 and "Invalid or unsupported" in proc.stderr
+
+
+# ------------------------------------------------------------------------- find_secrets / search_code
+def test_secret_lead_classification():
+    from tools import secret_lead_kind
+    for line in (
+        'export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE',
+        'access_key = "AKIAABCDEFGHIJKLMNOP"',
+        "secret: 'keyboard cat',",
+        'password: "pass"',
+        "      password: S3cr3tPassw0rd",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        'token = "ghp_' + "a" * 36 + '"',
+    ):
+        assert secret_lead_kind(line), line
+    for line in (
+        'password = os.getenv("DB_PASSWORD", "changeme")',
+        'api_key = "YOUR_API_KEY_HERE"',
+        'password: "${DB_PASSWORD}"',
+        "password = password_hash",
+        "token: string",
+        'password: "Enter your password to continue"',
+        'secret = "<redacted>"',
+        "@fa-var-user-secret: \"\\f21b\";",
+        "Sample reset link: /reset?token=abcdef123456",
+        "enable_password: true",
+    ):
+        assert not secret_lead_kind(line), line
+
+
+def test_find_secrets_filters_context_and_redacts(tmp_path):
+    make_tree(tmp_path, {
+        "infra/ec2.tf": 'user_data = "AWS=AKIAABCDEFGHIJKLMNOP"\n',
+        "server.js": "app.use(session({ secret: 'keyboard cat' }))\n",
+        "tests/test_cfg.py": 'password = "hunter2hunter2"\n',
+        "docs/guide.md": 'password = "hunter2hunter2"\n',
+        ".env.example": "API_KEY=abcdef123456\n",
+        "public/vendor/lib.js": 'var secret = "abcdef123456";\n',
+        "styles/icons.scss": '$fa-var-user-secret: "\\f21b";\n',
+        "package-lock.json": '"token": "abcdef1234567890"\n',
+        "ok.py": 'password = os.environ["DB_PASSWORD"]\n',
+    })
+    out = tools.find_secrets(str(tmp_path))
+    assert "infra/ec2.tf:1" in out and "server.js:1" in out
+    for noise in ("tests/", "docs/", ".env.example", "vendor", "icons.scss", "package-lock", "ok.py"):
+        assert noise not in out.split("Excluded")[0], noise
+    assert "AKIAABCDEFGHIJKLMNOP" not in out  # values are redacted
+    assert "Excluded" in out and "never copy the value" in out
+    assert "No credential-looking strings" in tools.find_secrets(str(tmp_path / "docs"))
+
+
+def test_search_code_caps_matches_per_file_and_ranks_source_first(tmp_path):
+    make_tree(tmp_path, {
+        "README.md": "\n".join("token docs" for _ in range(20)),
+        "package-lock.json": "\n".join('"token": 1' for _ in range(100)),
+        "tests/test_a.py": "token = 1\n",
+        "src/app.py": "\n".join(f"token = {i}" for i in range(12)),
+        "infra/main.tf": 'token = "abc"\n',
+    })
+    out = tools.search_code(str(tmp_path), "token")
+    lines = out.splitlines()
+    assert "package-lock.json" not in out  # noisy lockfile skipped by default
+    first_files = [ln.split(":")[0] for ln in lines[1:] if not ln.startswith("  ...")]
+    assert first_files.index("src/app.py") < first_files.index("README.md") < first_files.index("tests/test_a.py")
+    assert sum(1 for ln in lines if ln.startswith("src/app.py")) == tools.PER_FILE_MATCH_CAP
+    assert "+7 more matches in src/app.py" in out
+    # explicitly targeting the lockfile still works
+    assert "package-lock.json:1" in tools.search_code(str(tmp_path), "token", file_pattern="package-lock")
+
+
+def test_find_secrets_is_a_registered_tool():
+    from prompts import TOOL_DEFINITIONS
+    assert "find_secrets" in tools.AVAILABLE_TOOLS
+    assert "find_secrets" in {t["function"]["name"] for t in TOOL_DEFINITIONS}
+    assert "find_secrets" in tools.dispatch_tool_call(".", "nope", {})  # listed among available tools in the error
+
+
+def test_agent_learns_credential_leads_from_find_secrets(tmp_path):
+    make_tree(tmp_path, {"infra/ec2.tf": 'x = "AKIAABCDEFGHIJKLMNOP"\n'})
+    agent = _agent(tmp_path)
+    agent._execute_tool("find_secrets", {})
+    assert agent.secret_leads == [("infra/ec2.tf", 1)]
+    msg = agent._uncovered_secret_leads([{"file": "other.py"}])
+    assert msg == ["infra/ec2.tf:1"]
+    assert agent._uncovered_secret_leads([{"file": "infra/ec2.tf"}]) == []
+
+
+def test_docstring_examples_are_not_credential_leads(tmp_path):
+    src = (
+        'def f():\n'
+        '    """Example config::\n'
+        '\n'
+        "        SECRET_KEY = 'development key'\n"
+        '    """\n'
+        "    SECRET_KEY = 'real-hardcoded-key'\n"
+        '    note = """\n'
+        '    password = "alsoadocstring1"\n'
+        '    """\n'
+        '    return 1\n'
+    )
+    make_tree(tmp_path, {"app/config.py": src, "app/other.py": 'token = "ghp_' + "b" * 36 + '"\n'})
+    assert tools.triple_quoted_lines(src.splitlines()) == {2, 3, 4, 5, 7, 8, 9}
+    out = tools.find_secrets(str(tmp_path))
+    body = out.split("Excluded")[0]
+    assert "app/config.py:6" in body  # real assignment after the docstring
+    assert "app/config.py:4" not in body and "app/config.py:8" not in body
+    assert "app/other.py:1" in body
+
+
+def test_agent_ignores_docstring_hits_when_collecting_search_leads(tmp_path):
+    src = 'def f():\n    """\n    SECRET_KEY = \'development key\'\n    """\n'
+    make_tree(tmp_path, {"cfg.py": src})
+    agent = _agent(tmp_path)
+    agent._execute_tool("search_code", {"pattern": "SECRET_KEY"})
+    assert agent.secret_leads == []
