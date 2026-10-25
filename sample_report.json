@@ -1,0 +1,45 @@
+{
+  "repository": "https://github.com/step-security/github-actions-goat",
+  "violations": [
+    {
+      "rule_id": "SEC-001",
+      "category": "security",
+      "severity": "critical",
+      "file": ".github/workflows/secret-in-build-log.yml",
+      "line": 29,
+      "description": "Sensitive secret (GCP Private Key) is explicitly echoed to the build logs.",
+      "evidence": "echo \"GCP Private Key: $PRIVATE_KEY\"",
+      "recommendation": "Remove the echo statement that logs the private key. Use masking if logging is necessary for debugging."
+    },
+    {
+      "rule_id": "CI-001",
+      "category": "github_actions_ci",
+      "severity": "high",
+      "file": ".github/workflows/PRTargetWorkflow.yml",
+      "line": 4,
+      "description": "pull_request_target trigger used with actions/checkout, which checks out untrusted PR code in a context with elevated permissions/secrets.",
+      "evidence": "pull_request_target: ... uses: actions/checkout@v4",
+      "recommendation": "Avoid using pull_request_target with actions/checkout on untrusted PRs, or ensure the workflow does not run untrusted code. Use pull_request instead."
+    },
+    {
+      "rule_id": "CI-002",
+      "category": "github_actions_ci",
+      "severity": "high",
+      "file": ".github/workflows/toc-tou.yml",
+      "line": 28,
+      "description": "TOCTOU vulnerability: The workflow checks out PR code using `gh pr checkout` after a delay, which may result in checking out different code than what was approved.",
+      "evidence": "gh pr checkout ${{ github.event.pull_request.number }}",
+      "recommendation": "Always checkout the specific commit SHA that was approved (e.g., using `ref: ${{ github.event.pull_request.head.sha }}`)."
+    },
+    {
+      "rule_id": "DEP-001",
+      "category": "dependency_management",
+      "severity": "medium",
+      "file": ".github/workflows/hosted-file-monitor-with-hr.yml",
+      "line": 20,
+      "description": "GitHub Action is pinned to a mutable 'latest' tag, which can lead to non-reproducible builds and security risks if the action is compromised.",
+      "evidence": "uses: madhead/semver-utils@latest",
+      "recommendation": "Pin actions to a specific version (e.g., @v1.2.3) or a commit SHA."
+    }
+  ]
+}

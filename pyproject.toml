@@ -1,0 +1,37 @@
+[project]
+name = "devops-auditing-agent"
+version = "1.0.0"
+description = "LLM-driven agent that audits public GitHub repositories for DevOps best-practice violations"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "groq>=0.11.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "ruff>=0.1.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+extend-exclude = ["__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = [
+    "E501",  # long lines: prompts and regexes are intentionally wide
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
